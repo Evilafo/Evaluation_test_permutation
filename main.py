@@ -29,29 +29,6 @@ Cet outil réalise un **test de permutation (Y-scrambling)** associé à une **v
 afin de vérifier la robustesse et la significativité statistique du modèle QSAR.
 """)
 
-# --- Saisie des données par l'utilisateur ---
-st.header("1. Entrée des Données Moléculaires")
-
-# Données par défaut basées sur votre fichier
-default_data = """
-X1,X2,y
-1.48,1.340,0.34
-1.40,1.339,0.29
-2.08,1.339,0.41
-2.26,1.339,0.50
-1.26,1.340,0.15
-2.29,1.338,0.59
-3.62,1.339,0.70
-2.65,1.340,0.97
-"""
-
-st.info("Veuillez coller vos données au format CSV, avec une ligne d'en-tête. Les colonnes doivent être nommées 'X1', 'X2', ... pour les descripteurs et **'y'** pour la variable réponse.")
-data_input = st.text_area(
-    "Collez vos données ici :",
-    default_data,
-    height=200
-)
-
 # --- Fonction de Parsing des Données ---
 @st.cache_data
 def load_data(data_string):
@@ -86,7 +63,46 @@ def load_data(data_string):
         st.error(f"Erreur lors du chargement des données. Détail : {e}")
         return None, None
 
-df, X_cols = load_data(data_input)
+# --- Saisie des données par l'utilisateur ---
+st.header("1. Entrée des Données Moléculaires")
+
+input_method = st.radio(
+    "Choisissez votre méthode d'entrée des données :",
+    ("Copier-coller le texte", "Uploader un fichier CSV"),
+    horizontal=True
+)
+
+df = None
+X_cols = None
+
+if input_method == "Copier-coller le texte":
+    # Données par défaut basées sur votre fichier
+    default_data = """
+    X1,X2,y
+    1.48,1.340,0.34
+    1.40,1.339,0.29
+    2.08,1.339,0.41
+    2.26,1.339,0.50
+    1.26,1.340,0.15
+    2.29,1.338,0.59
+    3.62,1.339,0.70
+    2.65,1.340,0.97
+    """
+
+    st.info("Veuillez coller vos données au format CSV, avec une ligne d'en-tête. Les colonnes doivent être nommées 'X1', 'X2', ... pour les descripteurs et **'y'** pour la variable réponse.")
+    data_input = st.text_area(
+        "Collez vos données ici :",
+        default_data,
+        height=200
+    )
+    df, X_cols = load_data(data_input)
+
+elif input_method == "Uploader un fichier CSV":
+    uploaded_file = st.file_uploader("Choisissez un fichier CSV", type="csv")
+    if uploaded_file is not None:
+        # Pour lire le fichier uploadé, on le décode d'abord
+        string_data = uploaded_file.getvalue().decode("utf-8")
+        df, X_cols = load_data(string_data)
 
 if df is not None:
     st.subheader("Aperçu des Données Utilisées")
@@ -127,13 +143,30 @@ if df is not None:
 
     # --- Fonctions de calcul ---
     def q2_loo(modele, X, y):
-        """Calcule le Q² avec une validation croisée Leave-One-Out."""
-        loo = LeaveOneOut()
-        y_pred = cross_val_predict(modele, X, y, cv=loo)
-        ss_res = np.sum((y - y_pred)**2)
+        """
+        Calcule le Q² (LOO) de manière optimisée pour la régression linéaire.
+        Cette méthode évite de ré-entraîner le modèle n fois.
+        """
+        # S'assurer que X a une colonne de 1s pour l'intercept
+        X_with_intercept = np.c_[np.ones(X.shape[0]), X]
+        
+        # Entraîner le modèle une seule fois
+        modele.fit(X, y)
+        y_pred_full = modele.predict(X)
+        residuals = y - y_pred_full
+        
+        # Calculer la diagonale de la matrice chapeau (hat matrix)
+        try:
+            hat_diag = np.sum(X_with_intercept * (np.linalg.pinv(X_with_intercept.T @ X_with_intercept) @ X_with_intercept.T).T, axis=1)
+        except np.linalg.LinAlgError:
+            # Fallback si le calcul est instable
+            return q2_loo_fallback(modele, X, y)
+
+        # Calculer les résidus de validation croisée (PRESS)
+        press_residuals = residuals / (1 - hat_diag)
+        ss_press = np.sum(press_residuals**2)
         ss_tot = np.sum((y - np.mean(y))**2)
-        if ss_tot == 0: return 0 # Pour éviter la division par zéro
-        return 1 - ss_res / ss_tot
+        return 1 - ss_press / ss_tot
 
     # --- Fonction du Test de Permutation ---
     def permutation_test(X, y, n_permutations, random_seed):
@@ -168,7 +201,7 @@ if df is not None:
         return q2_original, np.array(q2_permuted)
 
     # --- Fonction pour trouver le R² maximal par permutation ---
-    def find_max_r2_permutation(X, y, n_random_perms=50000):
+    def find_max_r2_permutation(X, y, n_random_perms=5000):
         """
         Trouve le R² maximal possible en permutant y.
         - Test exact si n <= 9.
@@ -177,6 +210,7 @@ if df is not None:
         model = LinearRegression()
         n = len(y)
         max_r2 = -1
+        best_permutation = None
 
         try:
             total_perms = math.factorial(n)
@@ -188,15 +222,21 @@ if df is not None:
             for y_perm_tuple in itertools.permutations(y):
                 y_perm = np.array(y_perm_tuple)
                 model.fit(X, y_perm)
-                max_r2 = max(max_r2, r2_score(y_perm, model.predict(X)))
+                current_r2 = r2_score(y_perm, model.predict(X))
+                if current_r2 > max_r2:
+                    max_r2 = current_r2
+                    best_permutation = y_perm
         else: # Test par échantillonnage pour les n plus grands
             st.info(f"Recherche du R² maximal (estimation sur {n_random_perms} permutations aléatoires)...")
             for _ in range(n_random_perms):
                 y_shuffled = np.random.permutation(y)
                 model.fit(X, y_shuffled)
-                max_r2 = max(max_r2, r2_score(y_shuffled, model.predict(X)))
+                current_r2 = r2_score(y_shuffled, model.predict(X))
+                if current_r2 > max_r2:
+                    max_r2 = current_r2
+                    best_permutation = y_shuffled
         
-        return max_r2
+        return max_r2, best_permutation
 
     # --- Fonction de génération de rapport PDF ---
     def create_pdf_report(df, perm_results_df, anova_df, error_metrics_df, residuals_df, summary_df, fig):
@@ -296,7 +336,7 @@ if df is not None:
 
         with st.spinner(spinner_message):
             q2_original, q2_permuted = permutation_test(X, y, n_permutations, random_seed)
-            max_r2_perm = find_max_r2_permutation(X, y)
+            max_r2_perm, best_perm_y = find_max_r2_permutation(X, y)
         
         # Calcul du p-value: proportion des Q² permutés >= Q² original
         q2_count_higher = np.sum(q2_permuted >= q2_original)
@@ -360,7 +400,7 @@ if df is not None:
 
         # 2. Tableau des erreurs
         error_metrics_df = pd.DataFrame({
-            "Metrique": ["R²", "R² Ajuste", "Erreur Std. de l'Estimation (RMCE)", "Statistique de Durbin-Watson", "Observations"],
+            "Metrique": ["R²", "R² Ajusté", "Erreur Std. de l'Estimation (RMCE)", "Statistique de Durbin-Watson", "Observations"],
             "Valeur": [f"{r2_original:.4f}", f"{r2_adj:.4f}" if not np.isnan(r2_adj) else "N/A", f"{rmse:.4f}", f"{dw_stat:.4f}", str(n_obs)]
         }).set_index("Metrique")
 
@@ -398,7 +438,7 @@ if df is not None:
 
         # --- Tableau récapitulatif final ---
         summary_data = {
-            "Metrique": ["Q2 observe (LOO)", "p-value (permutation)", "R2", "R2 Ajuste", "F-Statistique (ANOVA)", "Signif. F (ANOVA)", "Erreur Std. de l'Estimation (RMCE)", "Statistique de Durbin-Watson"],
+            "Metrique": ["Q2 observe (LOO)", "p-value (permutation)", "R2", "R2 Ajusté", "F-Statistique (ANOVA)", "Signif. F (ANOVA)", "Erreur Std. de l'Estimation (RMCE)", "Statistique de Durbin-Watson"],
             "Utilite": ["Mesure la capacite predictive du modele sur de nouvelles donnees (robustesse).", "Probabilite que la performance observee (Q2) soit due au hasard.", "Mesure la proportion de la variance de 'y' expliquee par le modele (qualite de l'ajustement).", "Similaire au R2, mais penalise l'ajout de variables inutiles.", "Teste si au moins un des predicteurs est significativement lie a la variable reponse.", "La p-value associee au test F. Indique la significativite globale du modele.", "L'ecart-type des residus. Indique la magnitude typique de l'erreur de prediction.", "Detecte l'autocorrelation des residus. Une hypothese cle de la regression est leur independance."],
             "Interpretation Ideale": ["Le plus eleve possible (proche de 1). > 0.5 est souvent considere comme bon.", "Le plus bas possible (< 0.05).", "Le plus eleve possible (proche de 1).", "Proche du R2, indiquant que les variables sont utiles.", "Le plus eleve possible.", "Le plus bas possible (< 0.05).", "Le plus bas possible.", "Proche de 2. Des valeurs << 2 ou >> 2 indiquent un probleme."]
         }
@@ -417,6 +457,7 @@ if df is not None:
             "residuals_df": residuals_df,
             "summary_df": summary_df,
             "fig": fig,
+            "best_perm_y": best_perm_y,
             "df_input": df # Sauvegarde des données d'entrée pour le rapport
         }
 
@@ -485,6 +526,16 @@ if df is not None:
 
         # --- Section explicative sur le R² max par permutation ---
         with st.expander("🔍 À propos du 'R² maximal par permutation'"):
+            
+            # Création d'un DataFrame pour comparer y original et y permuté
+            perm_comparison_df = pd.DataFrame({
+                'y Original': results['df_input']['y'],
+                'Meilleure Permutation (y permuté)': results['best_perm_y']
+            })
+            perm_comparison_df['y Original'] = perm_comparison_df['y Original'].round(4)
+            perm_comparison_df['Meilleure Permutation (y permuté)'] = perm_comparison_df['Meilleure Permutation (y permuté)'].round(4)
+
+
             st.markdown("""
             Le calcul du **R² maximal par permutation** est une analyse complémentaire puissante. Il répond à la question : 
             > "Quel est le meilleur score R² que l'on pourrait obtenir par pur hasard avec ce jeu de données ?"
@@ -495,8 +546,13 @@ if df is not None:
 
             1.  **Mettre en perspective le R² original** : Un R² de 0.80 peut sembler excellent, mais s'il est possible d'obtenir un R² de 0.95 simplement en mélangeant les données au hasard, alors le score original perd de sa superbe.
             2.  **Détecter le sur-ajustement (Overfitting)** : Si le R² de votre modèle est très proche du R² maximal obtenu par chance, cela peut indiquer que votre modèle est sur-ajusté. Il a peut-être "mémorisé" le bruit dans les données plutôt que d'apprendre une véritable relation sous-jacente.
-            3.  **Renforcer la confiance** : Inversement, si le R² de votre modèle est significativement plus élevé que la moyenne des R² permutés, mais bien inférieur au R² maximal par chance, cela renforce la confiance dans le fait que votre modèle a trouvé une relation authentique et non un artefact statistique.
+            3.  **Renforcer la confiance** : Inversement, si le R² de votre modèle est bien inférieur au R² maximal par chance, cela renforce la confiance dans le fait que votre modèle a trouvé une relation authentique et non un artefact statistique.
             """)
+            
+            st.markdown("---")
+            st.markdown("##### Visualisation de la 'Meilleure' Permutation")
+            st.markdown("Ci-dessous, la comparaison entre le `y` original et la permutation de `y` qui a produit le R² maximal par chance. **Attention : cette permutation n'a aucune signification scientifique**, elle illustre simplement un artefact statistique.")
+            st.dataframe(perm_comparison_df)
 
         # --- Bouton de téléchargement du rapport ---
         st.markdown("---")
